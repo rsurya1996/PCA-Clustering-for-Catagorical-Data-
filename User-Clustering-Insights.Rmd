@@ -1,0 +1,447 @@
+---
+title: "User-Clustering"
+author: "Surya Balakrishnan Ramakrishnan"
+date: "16/12/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## User clustering for people who have selected shops in the Buttercrane
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+#Folder in the desktop
+library(cluster)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(Rtsne)
+library(factoextra)
+library(readxl)
+library(biganalytics)
+library(RPostgres)
+library(stringi)
+library(knitr)
+library(plotly)
+```
+
+```{r}
+setwd("C:/Users/3054863/Desktop/data science/clustering-insights")
+```
+
+
+
+## Sample Data from the database.
+
+```{r, echo=FALSE}
+con2 <- dbConnect(RPostgres::Postgres(), 
+                  host="pearlai-prod.cquyrubqha9e.eu-west-1.rds.amazonaws.com", 
+                  dbname="spiritsoft",
+                  user = "surya",
+                  password = stri_enc_toutf8("Ramkisurya7$"))
+                  #user= "Read-Only",
+                  #password= stri_enc_toutf8("7UY765T*£Y6Tybvc!"))
+```
+
+
+```{r}
+res <- dbSendQuery(con2, "
+
+SELECT  profile_id
+     ,demograph_id
+     , dp.gender
+     , dp.age_group
+     , dp.no_children
+     , CASE
+         WHEN dp.shopping_frequency = 1 THEN 'Everyday'
+         WHEN dp.shopping_frequency = 2 THEN 'Every Week'
+         WHEN dp.shopping_frequency = 3 THEN 'Every Two Weeks'
+         WHEN dp.shopping_frequency = 4 THEN 'Every Month'
+         WHEN dp.shopping_frequency = 5 THEN 'Every Three Months'
+             ELSE NULL
+        END AS shopping_frequency
+     , dp.marital_status
+     , dp.employment_status
+FROM (
+SELECT DISTINCT profile_id,demograph_id
+FROM common.profile_whitelist wl
+LEFT JOIN common.customer cc
+ON wl.customer_id = cc.id
+RIGHT JOIN common.profile cp
+ON wl.profile_id = cp.uuid
+where cc.centre_id = 6
+)active_users
+LEFT JOIN common.demograph_permutations dp
+ON active_users.demograph_id = dp.id;
+                   ")
+profiles <- dbFetch(res)
+dbClearResult(res)
+write.csv(profiles, "profiles.csv")
+DT::datatable(head(profiles))
+```
+
+
+```{r}
+res <- dbSendQuery(con2, paste("
+
+select profile_id, customer_id, cn.cust_name
+from common.profile_whitelist wl
+left join common.customer cn
+on wl.customer_id = cn.id
+where cn.is_active is TRUE and wl.profile_id in (", paste0(profiles$profile_id, collapse = ","), ");
+                   "), sep = "")
+
+shop_selection <- dbFetch(res)
+dbClearResult(res)
+write.csv(shop_selection, "shop_selection.csv")
+DT::datatable(head(shop_selection))
+```
+
+
+```{r}
+res <- dbSendQuery(con2, paste("
+
+select date(start_time), profile_id, customer_id, duration/60 dwell_mins
+from rollups.centre_tenant_visitor
+where profile_id in (", paste0(profiles$profile_id, collapse = ","), ") and date(start_time) >= '2019-11-01' and date(start_time) <= '2020-01-31';
+                   "), sep = "")
+
+visits <- dbFetch(res)
+dbClearResult(res)
+write.csv(visits, "visits.csv")
+DT::datatable(head(visits))
+```
+
+```{r}
+res <- dbSendQuery(con2, paste("
+
+select date(sent.text_sent_at), sent.client_report_id,  sent.customer_id, sent.cust_name, conv.converted_at
+from(
+    select text_sent_at, client_report_id, tc.customer_id, tn.cust_name
+    from rollups.centre_tenant_conversions tc
+    left join common.customer tn
+    on tc.customer_id = tn.id
+    where date(text_sent_at) >= '2019-11-01' and date(text_sent_at) <= '2020-01-31' and profile_id in (", paste0(profiles$profile_id, collapse = ","), ")
+        )sent
+left join (
+    select * from rollups.centre_tenant_conversions
+    where date(text_sent_at) >= '2019-11-01' and date(text_sent_at) <= '2020-01-31' and converted_at != '-infinity'and profile_id in and profile_id in (", paste0(profiles$profile_id, collapse = ","), ")
+    )conv
+on sent.client_report_id = conv.client_report_id; and date(start_time) >= '2019-11-01' and date(start_time) <= '2020-01-31';
+                   "), sep = "")
+
+conversions <- dbFetch(res)
+dbClearResult(res)
+#write.csv(visits, "visits.csv")
+DT::datatable(head(conversions))
+
+```
+
+
+## Profile Composition
+
+```{r}
+profiles[is.na(profiles)] <- "NA"
+profiles$demograph_id <- as.factor(profiles$demograph_id)
+profiles$gender <- as.factor(profiles$gender)
+profiles$age_group <- as.factor(profiles$age_group)
+profiles$no_children <- as.factor(profiles$no_children)
+profiles$shopping_frequency <- as.factor(profiles$shopping_frequency)
+profiles$marital_status <- as.factor(profiles$marital_status)
+profiles$employment_status <- as.factor(profiles$employment_status)
+summary(profiles)
+```
+
+
+
+
+
+```{r}
+#Conversion of catagorical data to numaric by computing the GOWER Distance Computes the measure of dissimilarities
+  gower_dist <- daisy(profiles, metric = c("gower"))
+  #Converting the GOVER distance as a matrix 
+  gower_mat <- as.matrix(gower_dist)
+```
+
+
+```{r}
+library(Gifi)
+fitord <- princals(profiles[,c(3:8)])
+```
+
+
+```{r, warning=FALSE}
+fitord
+summary(fitord)
+
+plot(fitord, plot.type = "transplot")
+plot(fitord, "loadplot", main = "Loadings Plot")  ## aspect ratio = 1
+plot(fitord, "biplot", labels.scores = TRUE, main = "") #Biplot User Data
+plot(fitord, "screeplot")
+```
+
+
+
+
+
+## K-Means Clustering
+
+Current Clustering methodology to be implemented in the buttercrane shopping centre
+
+Number of clusters = 5, number of number of iterations (starting point permutations) 5000
+```{r}
+#nstart needs to be set at 5000, once the demographic data has been made accurate.
+km.res <- bigkmeans(gower_mat, 5, nstart = 50)
+```
+
+## Cluster plot factor
+```{r}
+fviz_cluster(km.res, data = gower_mat,
+              ellipse.type = "convex",
+              palette = "jco",
+              ggtheme = theme_minimal())
+```
+
+
+
+## Cluster plot factor
+```{r}
+#Finds distance between catagorical variables of two columns 
+plot(profiles[,1:8],col=km.res$cluster)
+#fviz_cluster(km.res, data = gower_mat,
+#              ellipse.type = "convex",
+#              palette = "jco",
+#              ggtheme = theme_minimal())
+```
+
+
+```{r}
+cluster_data <- profiles %>%
+  mutate(cluster = km.res$cluster) %>%
+  group_by(cluster)
+
+```
+
+
+```{r}
+DT::datatable(head(cluster_data))
+```
+
+
+```{r}
+cluster1 <- cluster_data[cluster_data[,9] == 1,]
+cluster2 <- cluster_data[cluster_data[,9] == 2,]
+cluster3 <- cluster_data[cluster_data[,9] == 3,]
+cluster4 <- cluster_data[cluster_data[,9] == 4,]
+cluster5 <- cluster_data[cluster_data[,9] == 5,]
+```
+
+## Cluster Composition
+
+```{r}
+summary(cluster1)
+```
+
+```{r}
+summary(cluster2)
+```
+
+```{r}
+summary(cluster3)
+```
+
+```{r}
+summary(cluster4)
+```
+
+```{r}
+summary(cluster5)
+```
+
+```{r, echo=FALSE, eval=FALSE}
+smp_size <- floor(0.50 * nrow(cluster1))
+set.seed(123)
+index <- sample(seq_len(nrow(cluster1)), size = smp_size)
+treatment1 <- cluster1[index, ]
+placebo1 <- cluster1[-index,]
+```
+
+```{r, echo=FALSE, eval=FALSE}
+smp_size <- floor(0.50 * nrow(cluster2))
+set.seed(123)
+index <- sample(seq_len(nrow(cluster2)), size = smp_size)
+treatment2 <- cluster2[index, ]
+placebo2 <- cluster2[-index,]
+```
+
+```{r, echo=FALSE, eval=FALSE}
+smp_size <- floor(0.50 * nrow(cluster3))
+set.seed(123)
+index <- sample(seq_len(nrow(cluster3)), size = smp_size)
+treatment3 <- cluster3[index, ]
+placebo3 <- cluster3[-index,]
+```
+
+```{r, echo=FALSE, eval=FALSE}
+smp_size <- floor(0.50 * nrow(cluster4))
+set.seed(123)
+index <- sample(seq_len(nrow(cluster4)), size = smp_size)
+treatment4 <- cluster4[index, ]
+placebo4 <- cluster4[-index,]
+```
+
+```{r, echo=FALSE, eval=FALSE}
+smp_size <- floor(0.50 * nrow(cluster5))
+set.seed(123)
+index <- sample(seq_len(nrow(cluster5)), size = smp_size)
+treatment5 <- cluster5[index, ]
+placebo5 <- cluster5[-index,]
+```
+
+```{r}
+merged_treatment <- rbind(treatment1,treatment2,treatment3,treatment4,treatment5)
+merged_placebo <- rbind(placebo1,placebo2,placebo3,placebo4,placebo5)
+```
+
+
+```{r, echo=FALSE, eval=FALSE}
+#Write CSV Statements to be pushed out
+write.csv(cluster_data, 'profiles.csv')
+write.csv(merged_treatment, 'treatment.csv')
+write.csv(merged_placebo, 'placebo.csv')
+
+write.csv(profiles, 'profiles.csv')
+write.csv(cluster1, 'cluster1.csv')
+write.csv(cluster2, 'cluster2.csv')
+write.csv(cluster3, 'cluster3.csv')
+write.csv(cluster4, 'cluster4.csv')
+write.csv(cluster5, 'cluster5.csv')
+write.csv(treatment1, 'treatment1.csv')
+write.csv(treatment2, 'treatment2.csv')
+write.csv(treatment3, 'treatment3.csv')
+write.csv(treatment4, 'treatment4.csv')
+write.csv(treatment5, 'treatment5.csv')
+write.csv(placebo1, 'placebo1.csv')
+write.csv(placebo2, 'placebo2.csv')
+write.csv(placebo3, 'placebo3.csv')
+write.csv(placebo4, 'placebo4.csv')
+write.csv(placebo5, 'placebo5.csv')
+```
+
+```{r, echo=FALSE, eval=FALSE}
+res <- dbSendQuery(con2, paste("
+
+select ad_id, customer_id, count(ad_id) conversions
+    from rollups.centre_tenant_conversions
+    where
+    text_sent_at between '2020-01-01' and '2020-01-31'
+    and centre_id = 6
+    and profile_id in(",paste0(treatment1$profile_id, collapse = ","),")
+    group by ad_id, customer_id
+    order by conversions DESC;
+                   ", sep = ""))
+
+
+message1 <- dbFetch(res)
+dbClearResult(res)
+DT::datatable(head(message1))
+```
+
+```{r, echo=FALSE, eval=FALSE}
+res <- dbSendQuery(con2, paste("
+
+select ad_id, customer_id, count(ad_id) conversions
+    from rollups.centre_tenant_conversions
+    where
+    text_sent_at between '2020-01-01' and '2020-01-31'
+    and centre_id = 6
+    and profile_id in(",paste0(treatment2$profile_id, collapse = ","),")
+    group by ad_id, customer_id
+    order by conversions DESC;
+                   ", sep = ""))
+
+
+message2 <- dbFetch(res)
+dbClearResult(res)
+DT::datatable(head(message2))
+```
+
+```{r, echo=FALSE, eval=FALSE}
+res <- dbSendQuery(con2, paste("
+
+select ad_id, customer_id, count(ad_id) conversions
+    from rollups.centre_tenant_conversions
+    where
+    text_sent_at between '2020-01-01' and '2020-01-31'
+    and centre_id = 6
+    and profile_id in(",paste0(treatment3$profile_id, collapse = ","),")
+    group by ad_id, customer_id
+    order by conversions DESC;
+                   ", sep = ""))
+
+
+message3 <- dbFetch(res)
+dbClearResult(res)
+DT::datatable(head(message3))
+```
+
+```{r, echo=FALSE, eval=FALSE}
+res <- dbSendQuery(con2, paste("
+
+select ad_id, customer_id, count(ad_id) conversions
+    from rollups.centre_tenant_conversions
+    where
+    text_sent_at between '2020-01-01' and '2020-01-31'
+    and centre_id = 6
+    and profile_id in(",paste0(treatment4$profile_id, collapse = ","),")
+    group by ad_id, customer_id
+    order by conversions DESC;
+                   ", sep = ""))
+
+
+message4 <- dbFetch(res)
+dbClearResult(res)
+DT::datatable(head(message4))
+```
+
+```{r, echo=FALSE, eval=FALSE}
+res <- dbSendQuery(con2, paste("
+
+select ad_id, customer_id, count(ad_id) conversions
+    from rollups.centre_tenant_conversions
+    where
+    text_sent_at between '2020-01-01' and '2020-01-31'
+    and centre_id = 6
+    and profile_id in(",paste0(treatment5$profile_id, collapse = ","),")
+    group by ad_id, customer_id
+    order by conversions DESC;
+                   ", sep = ""))
+
+
+message5 <- dbFetch(res)
+dbClearResult(res)
+DT::datatable(head(message5))
+```
+
+```{r}
+message1$cluster_id <- 1
+message2$cluster_id <- 2
+message3$cluster_id <- 3
+message4$cluster_id <- 4
+message5$cluster_id <- 5
+merged_message <- rbind(message1,message2,message3,message3,message4,message5)
+```
+
+
+```{r, echo=FALSE, eval=FALSE}
+#Write CSV Statements to be pushed out
+write.csv(merged_message, 'messages.csv')
+write.csv(message1,'message1.csv')
+write.csv(message2,'message2.csv')
+write.csv(message3,'message3.csv')
+write.csv(message4,'message4.csv')
+write.csv(message5,'message5.csv')
+```
+
